@@ -22,4 +22,6 @@ python main_graph.py
 streamlit run app.py
 ```
 
+## 콘솔 접근
+ssh -i "Movie-RAG-Bot.pem" ubuntu@3.35.157.72
 

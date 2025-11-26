@@ -1,131 +1,108 @@
-# broad_recommendation.py
+# src/broad_recommendation.py
 
-# %%
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.documents import Document
-
 from state import AgentState
-# retriever가 아닌 vector_store를 직접 임포트하여 filter 기능 사용
+# service.py에서 vector_store를 가져옵니다.
 from service import llm, vector_store 
 
-# %%
-# --- Node 2: 광범위 추천 RAG 쿼리 생성 ---
-
+# --- 1. 광범위 추천 쿼리 생성 프롬프트 최적화 ---
 broad_rag_prompt_template = """
-당신은 RAG 검색을 위한 추천 쿼리 생성기입니다.
-제공된 '검색 조건'을 바탕으로, 이 조건에 부합하는 작품(영화, 드라마)을 찾기 위한 RAG 검색 쿼리를 생성해주세요.
-
-쿼리는 사용자가 찾고자 하는 작품의 핵심 특징(장르, 분위기, 키워드 등)을 요약해야 합니다.
+당신은 영화/드라마 추천 전문가입니다.
+제공된 [검색 조건]을 바탕으로, Vector DB에서 유사한 작품을 찾기 위한 **핵심 키워드 문장** 하나를 생성하세요.
 
 [검색 조건]
 {rag_context}
 
-[조건 요약 RAG 검색 쿼리]
+[지시사항]
+1. "어떤 영화를 찾으시나요?" 같은 사족을 붙이지 마세요.
+2. 오직 검색에 필요한 분위기, 장르, 키워드만 나열하세요.
+3. 예시: "긴장감 넘치는 스릴러, 반전 있는 결말"
 """
 
 broad_rag_prompt = ChatPromptTemplate.from_template(broad_rag_prompt_template)
 broad_rag_chain = broad_rag_prompt | llm | StrOutputParser()
 
 def generate_broad_rag_query(state: AgentState) -> AgentState:
-    """
-    (플로우 2단계)
-    'rag_context' (검색 조건)를 기반으로
-    광범위한 추천을 위한 RAG 쿼리를 생성하여 'rag_query'에 덮어씌웁니다.
-    """
     print("--- RAG: 광범위 추천 쿼리 생성 중 ---")
     rag_context = state.get('rag_context')
-
-    if not rag_context or rag_context == " - (No specific query details provided) -":
-        print("경고: rag_context가 비어있어 원본 쿼리로 쿼리 생성 시도.")
-        rag_context = state.get('query')
-
-    new_rag_query = broad_rag_chain.invoke({"rag_context": rag_context})
     
-    print(f"--- 생성된 광범위 추천 쿼리 (rag_query로 업데이트): {new_rag_query} ---")
-    return {"rag_query": new_rag_query}
+    if not rag_context or rag_context.strip() == "- (No specific query details provided) -":
+        # 컨텍스트가 없으면 사용자 원본 쿼리 사용
+        rag_query = state.get('query')
+    else:
+        rag_query = broad_rag_chain.invoke({"rag_context": rag_context})
+    
+    print(f"생성된 검색 쿼리: {rag_query}")
+    return {"rag_query": rag_query}
 
-# %%
-# --- Node 3: 메타데이터 필터링을 통한 검색 ---
+# --- 2. Pinecone 메타데이터 필터링 ---
 
 def _build_metadata_filter(state: AgentState) -> Optional[Dict[str, Any]]:
     """
-    AgentState를 기반으로 ChromaDB에서 사용할 메타데이터 필터를 생성합니다.
+    Pinecone용 메타데이터 필터를 생성합니다.
+    데이터 저장 시 키 이름: genre, ott, casts, director, year, title, rating, type
     """
+    filters = []
     
-    # $and 조건을 기본으로 하는 필터 리스트
-    filter_list = []
-    
-    # --- List 기반 필드 처리 (genre, ott, casts, director) ---
-    # 사용자가 ["Action", "SF"]를 요청하면, 
-    # "Action" 이나 "SF"가 포함된 문서를 찾도록 $or 로직을 구성합니다.
-    
-    list_fields = ['genre', 'ott', 'casts', 'director']
-    
-    for field in list_fields:
-        values = state.get(field)
+    # 1. 리스트형 필드 처리 (OR 조건)
+    # 사용자가 'Action'과 'SF'를 원하면 -> genre가 Action이거나 SF인 것 검색
+    # Pinecone에서 리스트 필드에 대한 $eq는 "contains"의 의미를 가집니다.
+    list_fields_map = {
+        'genre': 'genre',       # state key -> DB key
+        'ott': 'ott',
+        'casts': 'casts',
+        'director': 'director'
+    }
+
+    for state_key, db_key in list_fields_map.items():
+        values = state.get(state_key)
         if values:
-            # Enum/str-to-str 변환
+            # Enum이나 객체인 경우 문자열로 변환
             str_values = [v.value if hasattr(v, 'value') else str(v) for v in values]
             
             if str_values:
                 if len(str_values) == 1:
-                    # 값이 하나면 $eq 사용 (예: {"genre": {"$eq": "Action"}})
-                    filter_list.append({field: {"$eq": str_values[0]}})
+                    filters.append({db_key: {"$eq": str_values[0]}})
                 else:
-                    # 값이 여러 개면 $or 사용 (예: {"$or": [{"genre": ...}, {"genre": ...}]})
-                    or_clause = [{field: {"$eq": v}} for v in str_values]
-                    filter_list.append({"$or": or_clause})
+                    # 값이 여러 개면 $or 연산 (하나라도 포함되면 매칭)
+                    or_conditions = [{db_key: {"$eq": v}} for v in str_values]
+                    filters.append({"$or": or_conditions})
 
-    # --- 단일 값 필드 처리 (year) ---
+    # 2. 단일 값 필드 처리 (year)
     if state.get('year'):
-        # (예: {"year": {"$eq": 2020}})
-        filter_list.append({"year": {"$eq": state['year']}})
+        # year는 숫자형으로 저장했으므로 $eq (정확히 일치) 또는 $gte (이후) 등 사용 가능
+        # 여기서는 편의상 $eq로 처리 (사용자 의도에 따라 수정 가능)
+        filters.append({"year": {"$eq": state['year']}})
     
-    # --- 최종 필터 조합 ---
-    if not filter_list:
-        return None # 적용할 필터 없음
+    if not filters:
+        return None
     
-    if len(filter_list) == 1:
-        return filter_list[0] # 단일 조건
+    if len(filters) == 1:
+        return filters[0]
     
-    # 여러 조건이 있으면 $and 로 묶음
-    return {"$and": filter_list}
-
+    # 여러 필드 조건은 $and로 묶음 (예: 장르가 액션이면서 OTT가 넷플릭스인 것)
+    return {"$and": filters}
 
 def retrieve_with_filter(state: AgentState) -> AgentState:
-    """
-    (플로우 3단계)
-    'rag_query' (semantic)와 state의 세부 정보 (metadata filter)를
-    모두 사용하여 RAG 문서를 검색합니다.
-    """
-    print("--- RAG: 메타데이터 필터링으로 검색 중 ---")
+    print("--- RAG: 메타데이터 필터링 검색 (Pinecone) ---")
     
     rag_query = state.get('rag_query')
     if not rag_query:
-        print("경고: RAG 쿼리가 없어 원본 쿼리로 시맨틱 검색 시도.")
         rag_query = state['query']
 
-    # 1. 메타데이터 필터 생성
     metadata_filter = _build_metadata_filter(state)
     
-    search_kwargs = {'k': 3} # service.py의 기본값
-    
+    search_kwargs = {'k': 5} # 검색 개수
     if metadata_filter:
-        print(f"--- 적용된 메타데이터 필터: {metadata_filter} ---")
+        print(f"적용된 필터: {metadata_filter}")
         search_kwargs['filter'] = metadata_filter
-        
-        # 필터가 있으면 vector_store.similarity_search 사용
-        docs = vector_store.similarity_search(
-            query=rag_query,
-            **search_kwargs
-        )
-    else:
-        print("--- 메타데이터 필터 없음. 시맨틱 검색만 수행 ---")
-        docs = vector_store.similarity_search(
-            query=rag_query,
-            **search_kwargs
-        )
+    
+    # Pinecone 검색
+    docs = vector_store.similarity_search(
+        query=rag_query,
+        **search_kwargs
+    )
     
     return {'context': docs}
