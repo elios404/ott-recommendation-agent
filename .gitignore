@@ -1,4 +1,20 @@
+# Environment and credentials
 .env
-.DS_Store
+.env.*
+!.env.example
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local vector database
 db/
-Movie-RAG-Bot.pem
+
+# macOS
+.DS_Store
